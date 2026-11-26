@@ -1,7 +1,7 @@
 # Dependency stubs
 
 The packages here replace two transitive runtime dependencies through `overrides` in `package.json`, so neither real package is installed or bundled.
-`test/dist.test.ts` fails if either one returns to `dist/index.cjs`.
+`test/dist.test.ts` fails if either real package returns to `dist/index.cjs`.
 
 ## tunnel
 
@@ -20,5 +20,5 @@ The stub passes `JSONParse` and `JSONStringify` through to `JSON.parse` and `JSO
 ## Removing a stub
 
 A stub goes away when its package is maintained by more than one person and the action needs it, for example if GitHub moves installation or comment IDs to 64-bit integers, which would show up as 404s for the wrong ID.
-Removing one means deleting its `overrides` entry and directory, running `npm install` and `npm run build`, and updating `test/dist.test.ts`.
+Removing one means deleting its `overrides` entry and directory, running `npm install` and `npm run build`, and removing its case from `test/dist.test.ts`.
 If an `@octokit/request` or `@actions/http-client` update calls more of either package than the stub exports, the build or tests fail.
