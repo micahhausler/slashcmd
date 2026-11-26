@@ -1,0 +1,40 @@
+{
+  "name": "slashcmd",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Slash commands from pull request comments, run as a GitHub App.",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "esbuild src/index.ts --bundle --platform=node --target=node24 --format=cjs --outfile=dist/index.cjs --legal-comments=none",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint . && prettier --check . && actionlint && shellcheck bin/setup",
+    "check-dist": "npm run build && git diff --exit-code -- dist && test -z \"$(git ls-files --others --exclude-standard dist)\"",
+    "format": "prettier --write ."
+  },
+  "dependencies": {
+    "@actions/core": "^3.0.1",
+    "@actions/github": "^9.1.1"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^24",
+    "esbuild": "^0.28.2",
+    "eslint": "^10.15.0",
+    "prettier": "^3.10.1",
+    "typescript": "~6.0",
+    "typescript-eslint": "^8.74.0",
+    "vitest": "^5.1.2"
+  },
+  "license": "MIT",
+  "overrides": {
+    "tunnel": "file:./stubs/tunnel",
+    "json-with-bigint": "file:./stubs/json-with-bigint"
+  },
+  "allowScripts": {
+    "esbuild": false
+  }
+}

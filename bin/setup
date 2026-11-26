@@ -1,0 +1,379 @@
+#!/usr/bin/env bash
+# setup: create slashcmd GitHub Apps and sync their keys to repositories.
+#
+# usage:
+#   setup app  [--name NAME] [--vault VAULT] [--port PORT]
+#   setup sync [--config FILE] [--open-pr] [--dry-run]
+#
+# app creates an App named <owner>-slashcmd, where owner is the owner of this
+# checkout's origin. Public and private repositories use separate Apps, and
+# App names are unique on GitHub, so the second App needs --name.
+#
+# The sync config lives outside this repository, because it names private
+# repositories and 1Password items. Default: ${XDG_CONFIG_HOME:-~/.config}/slashcmd/config
+# Each app line names the 1Password item that `setup app` created, and applies
+# to the repo lines after it.
+#
+#   app op://<vault>/<item>
+#   repo <owner>/<repo>
+#   app op://<vault>/<other item>
+#   repo <owner>/<repo>
+#
+# sync puts each App's key in the repository's slashcmd environment, limited to
+# the default branch, and its client ID in a repository variable. It checks
+# .github/workflows/slashcmd.yml against examples/slashcmd.yml, with
+# OWNER/slashcmd replaced by the owner/repo of this checkout's origin.
+set -euo pipefail
+
+die() { echo "setup: $*" >&2; exit 1; }
+((BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4))) ||
+  die "needs bash 4.4 or newer (on macOS: brew install bash)"
+
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; }
+case ${1:-} in
+  app|sync) ;;
+  -h|--help|help) usage; exit 0 ;;
+  *) usage >&2; exit 2 ;;
+esac
+
+here=$(cd "$(dirname "$0")/.." && pwd)
+secret_name=SLASHCMD_APP_KEY
+variable_name=SLASHCMD_APP_CLIENT_ID
+environment=slashcmd
+workflow_path=.github/workflows/slashcmd.yml
+
+self_repo=${SLASHCMD_REPO:-$(git -C "$here" remote get-url origin 2>/dev/null |
+  sed -E 's#^(git@|ssh://git@|https://)github\.com[:/]##; s#\.git$##' || true)}
+[[ $self_repo =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] ||
+  die "can't tell owner/repo from origin; set SLASHCMD_REPO"
+self_owner=${self_repo%%/*}
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+need() { command -v "$1" >/dev/null || die "$1 not found on PATH"; }
+lower() { tr '[:upper:]' '[:lower:]' <<<"$1"; }
+
+# GET; returns 4 on 404
+api_get() {
+  local rc=0
+  gh api "$@" >"$tmp/out" 2>"$tmp/err" || rc=$?
+  ((rc == 0)) && { cat "$tmp/out"; return 0; }
+  grep -q 'HTTP 404' "$tmp/err" && return 4
+  cat "$tmp/err" >&2
+  return 1
+}
+
+cmd_app() {
+  local name="" vault="" port=8787
+  while (($#)); do
+    case $1 in
+      --name) name=$2; shift 2 ;;
+      --vault) vault=$2; shift 2 ;;
+      --port) port=$2; shift 2 ;;
+      *) die "app: unknown flag $1" ;;
+    esac
+  done
+  need gh; need op; need jq; need python3
+
+  if [[ -z $name ]]; then
+    name=$self_owner-slashcmd
+    local rc=0
+    api_get "apps/$(lower "$name")" >/dev/null || rc=$?
+    case $rc in
+      0) die "an App named $name already exists; pass --name for the second App" ;;
+      4) ;;
+      *) die "can't check whether App $name exists" ;;
+    esac
+  fi
+
+  local owner_type form_url
+  owner_type=$(gh api "users/$self_owner" --jq .type)
+  if [[ $owner_type == Organization ]]; then
+    form_url=https://github.com/organizations/$self_owner/settings/apps/new
+  else
+    form_url=https://github.com/settings/apps/new
+  fi
+
+  local state manifest code app
+  state=$(python3 -I -c 'import secrets; print(secrets.token_hex(16))')
+  manifest=$(jq -nc --arg name "$name" --arg port "$port" --arg url "https://github.com/$self_repo" '{
+    name: $name,
+    url: $url,
+    hook_attributes: {url: $url, active: false},
+    redirect_url: "http://127.0.0.1:\($port)/callback",
+    public: false,
+    default_permissions: {contents: "write"},
+    default_events: []
+  }')
+
+  local opener
+  opener=$(command -v open || command -v xdg-open || true)
+  echo "Opening http://127.0.0.1:$port/ to create the App on GitHub."
+  [[ -n $opener ]] && (sleep 1; "$opener" "http://127.0.0.1:$port/") &
+  code=$(MANIFEST=$manifest STATE=$state PORT=$port FORM_URL=$form_url python3 -I -c '
+import html, http.server, os, sys, urllib.parse
+manifest, state, port = os.environ["MANIFEST"], os.environ["STATE"], int(os.environ["PORT"])
+action = html.escape(os.environ["FORM_URL"] + "?state=" + state)
+page = f"""<!doctype html><form id=f method=post action="{action}">
+<input type=hidden name=manifest value="{html.escape(manifest)}"></form>
+<script>document.getElementById("f").submit()</script>"""
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def reply(self, status, body):
+        self.send_response(status); self.send_header("Content-Type", "text/html"); self.end_headers()
+        self.wfile.write(body.encode())
+    def do_GET(self):
+        if self.headers.get("Host") != f"127.0.0.1:{port}":
+            return self.reply(400, "Unexpected host.")
+        u = urllib.parse.urlparse(self.path)
+        if u.path == "/":
+            return self.reply(200, page)
+        q = urllib.parse.parse_qs(u.query)
+        if u.path == "/callback" and q.get("state") == [state] and q.get("code"):
+            self.reply(200, "App created. You can close this tab.")
+            print(q["code"][0]); sys.stdout.flush(); os._exit(0)
+        self.reply(404, "Unexpected request.")
+http.server.HTTPServer(("127.0.0.1", port), H).serve_forever()
+')
+
+  app=$(gh api -X POST "app-manifests/$code/conversions")
+  local slug client_id app_id app_owner
+  slug=$(jq -r .slug <<<"$app")
+  client_id=$(jq -r .client_id <<<"$app")
+  app_id=$(jq -r .id <<<"$app")
+  app_owner=$(jq -r .owner.login <<<"$app")
+  if [[ $(lower "$app_owner") != "$(lower "$self_owner")" ]]; then
+    die "$slug is owned by $app_owner, not $self_owner; delete it from the App settings and rerun"
+  fi
+
+  vault=$(jq '{
+    title: "\(.slug) GitHub App",
+    category: "SECURE_NOTE",
+    fields: [
+      {id: "notesPlain", type: "STRING", purpose: "NOTES", label: "notesPlain", value: .pem},
+      {id: "client_id", type: "STRING", label: "client id", value: .client_id},
+      {id: "app_id", type: "STRING", label: "app id", value: (.id | tostring)},
+      {id: "slug", type: "STRING", label: "slug", value: .slug}
+    ]
+  }' <<<"$app" | op item create ${vault:+--vault "$vault"} --format json - | jq -r .vault.name) || {
+    local f
+    f=$(umask 077; mktemp "${TMPDIR:-/tmp}/$slug.XXXXXX")
+    jq -r .pem <<<"$app" >"$f"
+    die "1Password save failed; key saved to $f. Store it, then delete the file."
+  }
+
+  cat <<EOF
+
+Created $slug (app id $app_id).
+  client id:  $client_id
+  1Password:  op://$vault/$slug GitHub App
+
+Next:
+  1. Install the App on each repository: https://github.com/apps/$slug/installations/new
+  2. Add to the sync config, followed by its repo lines, then run bin/setup sync:
+     app op://$vault/$slug GitHub App
+EOF
+}
+
+cmd_sync() {
+  local config=${XDG_CONFIG_HOME:-$HOME/.config}/slashcmd/config
+  open_pr=0 dry_run=0
+  while (($#)); do
+    case $1 in
+      --config) config=$2; shift 2 ;;
+      --open-pr) open_pr=1; shift ;;
+      --dry-run) dry_run=1; shift ;;
+      *) die "sync: unknown flag $1" ;;
+    esac
+  done
+  need gh
+  ((dry_run)) || need op
+  [[ -f $config ]] || die "no config at $config"
+
+  local app="" kind="" value="" n=0 rc
+  local -a failed=()
+  local -A keys=() clients=()
+  while read -r kind value <&3 || [[ -n $kind ]]; do
+    case $kind in
+      ''|'#'*) ;;
+      app)
+        app=$value
+        [[ -n ${clients[$app]:-} ]] && continue
+        if ((dry_run)); then
+          clients[$app]=$(op read "$app/client id" 2>/dev/null) || clients[$app]="<client id>"
+        else
+          clients[$app]=$(op read "$app/client id")
+          keys[$app]=$(op read "$app/notesPlain")
+        fi
+        ;;
+      repo)
+        [[ -n $app ]] || die "$config: repo $value comes before any app line"
+        n=$((n + 1))
+        set +e
+        (set -e; sync_repo "$value" "${clients[$app]}" "${keys[$app]:-}")
+        rc=$?
+        set -e
+        ((rc == 0)) || failed+=("$value")
+        ;;
+      *) die "$config: unknown line: $kind $value" ;;
+    esac
+    kind="" value=""
+  done 3<"$config"
+  ((n)) || die "$config has no repo lines"
+  ((${#failed[@]} == 0)) || die "failed: ${failed[*]}"
+}
+
+sync_repo() {
+  local r=$1 client_id=$2 key=$3 base rc=0
+  base=$(api_get "repos/$r" --jq .default_branch) || rc=$?
+  case $rc in
+    0) ;;
+    4) echo "$r: not found, or not visible to this gh login" >&2; return 1 ;;
+    *) return 1 ;;
+  esac
+  sync_environment "$r" "$base" "$key"
+  if ((dry_run)); then
+    echo "$r: would set variable $variable_name=$client_id"
+  else
+    gh variable set "$variable_name" -R "$r" --body "$client_id"
+    echo "$r: set variable $variable_name"
+  fi
+  [[ $(lower "$r") == "$(lower "$self_repo")" ]] && return 0
+  sync_workflow "$r" "$base"
+}
+
+sync_environment() {
+  local r=$1 base=$2 key=$3 policies_url out="" rc=0 id type name have_base=0
+  local -a stale=()
+  policies_url=repos/$r/environments/$environment/deployment-branch-policies
+  if ((dry_run)); then
+    echo "$r: would set environment $environment to custom branch policies"
+  else
+    gh api -X PUT "repos/$r/environments/$environment" --input - >/dev/null <<<'{
+      "deployment_branch_policy": {"protected_branches": false, "custom_branch_policies": true}
+    }'
+  fi
+
+  out=$(api_get --paginate "$policies_url" \
+    --jq '.branch_policies[] | "\(.id)\t\(.type // "branch")\t\(.name)"') || rc=$?
+  case $rc in
+    0|4) ;;
+    *) return 1 ;;
+  esac
+  while IFS=$'\t' read -r id type name; do
+    [[ -n $id ]] || continue
+    if [[ $type == branch && $name == "$base" ]]; then
+      have_base=1
+    else
+      stale+=("$id:$type policy $name")
+    fi
+  done <<<"$out"
+
+  if ((!have_base)); then
+    if ((dry_run)); then
+      echo "$r: would add branch policy $base"
+    else
+      gh api -X POST "$policies_url" -f name="$base" -f type=branch >/dev/null
+      echo "$r: added branch policy $base"
+    fi
+  fi
+  local p
+  for p in "${stale[@]}"; do
+    if ((dry_run)); then
+      echo "$r: would delete ${p#*:}"
+    else
+      gh api -X DELETE "$policies_url/${p%%:*}" >/dev/null
+      echo "$r: deleted ${p#*:}"
+    fi
+  done
+
+  if ((dry_run)); then
+    echo "$r: would set $secret_name in environment $environment, limited to $base"
+    echo "$r: would delete repository secret $secret_name if present"
+    return 0
+  fi
+  printf '%s\n' "$key" | gh secret set "$secret_name" --env "$environment" -R "$r"
+  echo "$r: set $secret_name in environment $environment, limited to $base"
+
+  rc=0
+  api_get "repos/$r/actions/secrets/$secret_name" >/dev/null || rc=$?
+  case $rc in
+    0) gh secret delete "$secret_name" -R "$r"; echo "$r: deleted repository secret $secret_name" ;;
+    4) ;;
+    *) return 1 ;;
+  esac
+}
+
+sync_workflow() {
+  local r=$1 base=$2 want have="" rc=0 state
+  want=$(sed "s#uses: OWNER/slashcmd@#uses: $self_repo@#" "$here/examples/slashcmd.yml")
+  have=$(api_get "repos/$r/contents/$workflow_path" -H 'Accept: application/vnd.github.raw') || rc=$?
+  case $rc in
+    0) state="out of date" ;;
+    4) state=missing have="" ;;
+    *) echo "$r: can't read $workflow_path" >&2; return 1 ;;
+  esac
+  if [[ $rc == 0 && $have == "$want" ]]; then
+    echo "$r: $workflow_path is current"
+  elif ((open_pr && !dry_run)); then
+    open_workflow_pr "$r" "$base" "$want" "$([[ -n $have ]] && echo Update || echo Add)"
+  elif ((open_pr)); then
+    echo "$r: $workflow_path is $state; would open or update a pull request from slashcmd-workflow"
+  else
+    echo "$r: $workflow_path is $state; rerun with --open-pr"
+  fi
+}
+
+open_workflow_pr() {
+  local r=$1 base=$2 want=$3 verb=$4 branch=slashcmd-workflow base_sha on_branch="" file_sha="" rc=0 pr
+  local -a sha_arg=()
+  pr=$(gh pr list -R "$r" --head "$branch" --state open --json url --jq '.[0].url // empty')
+  base_sha=$(gh api "repos/$r/git/ref/heads/$base" --jq .object.sha)
+
+  api_get "repos/$r/git/ref/heads/$branch" >/dev/null || rc=$?
+  case $rc in
+    0)
+      if [[ -z $pr ]]; then
+        gh api -X PATCH "repos/$r/git/refs/heads/$branch" -f sha="$base_sha" -F force=true >/dev/null
+        echo "$r: reset $branch to $base"
+      fi
+      ;;
+    4) gh api -X POST "repos/$r/git/refs" -f ref="refs/heads/$branch" -f sha="$base_sha" >/dev/null ;;
+    *) return 1 ;;
+  esac
+
+  rc=0
+  file_sha=$(api_get "repos/$r/contents/$workflow_path?ref=$branch" --jq .sha) || rc=$?
+  case $rc in
+    0)
+      sha_arg=(-f sha="$file_sha")
+      on_branch=$(gh api "repos/$r/contents/$workflow_path?ref=$branch" -H 'Accept: application/vnd.github.raw')
+      ;;
+    4) ;;
+    *) return 1 ;;
+  esac
+
+  if [[ $on_branch == "$want" ]]; then
+    echo "$r: $branch already has the current $workflow_path"
+  else
+    gh api -X PUT "repos/$r/contents/$workflow_path" \
+      -f message="$verb the slashcmd workflow" \
+      -f content="$(printf '%s\n' "$want" | base64 | tr -d '\n')" \
+      -f branch="$branch" "${sha_arg[@]}" >/dev/null
+    echo "$r: wrote $workflow_path on $branch"
+  fi
+
+  if [[ -n $pr ]]; then
+    echo "$r: pull request already open: $pr"
+  else
+    gh pr create -R "$r" --base "$base" --head "$branch" \
+      --title "$verb the slashcmd workflow" \
+      --body "Runs slash commands such as \`/squash\` from pull request comments through $self_repo."
+  fi
+}
+
+case $1 in
+  app) shift; cmd_app "$@" ;;
+  sync) shift; cmd_sync "$@" ;;
+esac

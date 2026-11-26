@@ -1,0 +1,27 @@
+name: commands
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions: {}
+
+jobs:
+  slashcmd:
+    if: >-
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/') &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
+    runs-on: ubuntu-latest
+    environment: slashcmd
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./
+        with:
+          app-client-id: ${{ vars.SLASHCMD_APP_CLIENT_ID }}
+          app-key: ${{ secrets.SLASHCMD_APP_KEY }}

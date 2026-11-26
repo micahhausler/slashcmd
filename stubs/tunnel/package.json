@@ -1,0 +1,6 @@
+{
+  "name": "tunnel",
+  "version": "0.0.0-slashcmd-stub",
+  "type": "module",
+  "exports": "./index.js"
+}

@@ -1,0 +1,25 @@
+name: slashcmd
+description: Run slash commands such as /squash from pull request comments, as a GitHub App.
+branding:
+  icon: git-commit
+  color: gray-dark
+
+inputs:
+  app-client-id:
+    description: Client ID of the GitHub App that updates branches.
+    required: true
+  app-key:
+    description: Private key of the App that app-client-id names.
+    required: true
+  allowed-users:
+    description: Space-separated logins allowed to run commands, matched case-insensitively. Empty allows anyone with write access.
+    required: false
+    default: ""
+  github-token:
+    description: Token for permission lookups, reactions, comments, and reading the pull request, its branch, and its commits; needs contents read and pull-requests write.
+    required: false
+    default: ${{ github.token }}
+
+runs:
+  using: node24
+  main: dist/index.cjs
