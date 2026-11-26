@@ -64,7 +64,7 @@ This repository runs the commands on itself through [`.github/workflows/commands
 - `/squash` works only on branches in the same repository, not forks.
 - `/squash` handles pull requests of up to 250 commits, with a first-parent history that covers all of them.
 - The App's token has no `workflows` permission, so `/squash` fails on pull requests that change `.github/workflows/`.
-- The squashed commit is committed by the App's bot user and is unsigned, because GitHub signs an App's API commits only when they carry no custom author.
+- The squashed commit records the first commit's author as both author and committer, and is unsigned, because GitHub signs an App's API commits only when they carry no custom author.
 - Environment secrets in private repositories need a GitHub plan that supports environments there.
 
 ## Developing
